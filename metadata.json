@@ -1,5 +1,5 @@
 {
-  "name": "Custom Assistant Example",
+  "name": "Test ML Custom Assistant Example",
   "type": "helper",
   "properties": {
     "user_type": "all", 
