@@ -38,7 +38,7 @@
       });
       const locatorResult = await codioIDE.coachBot.ask({
         systemPrompt: "You identify student tasks in a Jupyter notebook and emit them as a structured JSON array. Return only valid JSON.",
-        userPrompt: "{% prompt 'AGENT_LOCATOR_COACH' %}",
+        userPrompt: "{% prompt 'AGENT_LOCATOR_V2' %}",
         vars: {
           STUDENT_NOTEBOOK: JSON.stringify(studentNotebook)
         }
