@@ -54,6 +54,8 @@
           GUIDE_INSTRUCTIONS: guideInstructions
         }
       }, { stream: false, preventMenu: true });
+      console.log("Result", coachResult)
+      
       const parsed = normalizeCoachJson(coachResult, "coach");
       console.log("parsed response", parsed)
       console.info("[Jupyter Hint v2] coach:success", summarizeCoachJson(parsed));
