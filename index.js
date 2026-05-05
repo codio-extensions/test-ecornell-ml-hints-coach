@@ -40,7 +40,8 @@
       console.info("[Jupyter Hint v2] locate:start");
       const tasks = locateTasks(studentNotebook);
       console.info("[Jupyter Hint v2] locate:success", summarizeTasks(tasks));
-
+      console.log("Tasks", tasks)
+      
       console.info("[Jupyter Hint v2] coach:start", {
         taskCount: tasks.length,
         guideInstructionChars: guideInstructions.length
@@ -54,6 +55,7 @@
         }
       }, { stream: false, preventMenu: true });
       const parsed = normalizeCoachJson(coachResult, "coach");
+      console.log("parsed response", parsed)
       console.info("[Jupyter Hint v2] coach:success", summarizeCoachJson(parsed));
 
       const hintText = typeof parsed.hint === "string" ? parsed.hint : "";
