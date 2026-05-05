@@ -1,18 +1,15 @@
-// Jupyter hint coach extension v2 -- deterministic locator + single LLM call.
-// Replaces the three-step pipeline in extension_code.js with one round trip.
+// Jupyter hint coach extension v2 -- chained agent pipeline.
+//
+// Two LLM calls:
+//   1. AGENT_LOCATOR_COACH receives the student notebook (Codio runtime
+//      shape: {type, content, id} per cell, no nbgrader metadata) and emits
+//      the TASKS_JSON array.
+//   2. AGENT_COACH_V2 receives that array plus the guide page and emits a
+//      hint after verifying tasks against NOTEBOOK_INSTRUCTOR_VIEW.
+//
+// All previous deterministic-locator JS has been removed -- it depended on
+// nbgrader metadata that Codio's getContext() does not preserve at runtime.
 (async function (codioIDE, window) {
-
-  const STUDENT_BEGIN = "# YOUR CODE HERE";
-  const STUDENT_END = "# END OF YOUR CODE";
-
-  // The instructor solution notebook is NOT readable from the extension at
-  // runtime. Codio injects it server-side as the NOTEBOOK_INSTRUCTOR_VIEW
-  // placeholder when the prompt is sent. The deterministic locator below
-  // therefore runs on the student notebook alone; the prompt aligns each
-  // task to the solution by grade_id.
-
-  const DEF_RE = /^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/m;
-  const RAISE_NOT_IMPL_RE = /^\s*raise\s+NotImplementedError\s*\(.*\)\s*$/;
 
   codioIDE.coachBot.register(
     "customHintsJupyterMLv2",
@@ -26,7 +23,6 @@
     try {
       console.info("[Jupyter Hint v2] getContext:start");
       const context = await codioIDE.coachBot.getContext();
-      console.log("context", context)
       console.info("[Jupyter Hint v2] getContext:success", summarizeContext(context));
 
       const notebookContext = getNotebookContext(context);
@@ -37,11 +33,23 @@
       const studentNotebook = notebookContext.content;
       const guideInstructions = getGuideInstructions(context);
 
-      console.info("[Jupyter Hint v2] locate:start");
-      const tasks = locateTasks(studentNotebook);
-      console.info("[Jupyter Hint v2] locate:success", summarizeTasks(tasks));
-      console.log("Tasks", tasks)
-      
+      console.info("[Jupyter Hint v2] locator:start", {
+        cellCount: Array.isArray(studentNotebook) ? studentNotebook.length : 0
+      });
+      const locatorResult = await codioIDE.coachBot.ask({
+        systemPrompt: "You identify student tasks in a Jupyter notebook and emit them as a structured JSON array. Return only valid JSON.",
+        userPrompt: "{% prompt 'AGENT_LOCATOR_COACH' %}",
+        vars: {
+          STUDENT_NOTEBOOK: JSON.stringify(studentNotebook)
+        }
+      }, { stream: false, preventMenu: true });
+      const tasks = parseLocatorTasks(locatorResult);
+      console.info("[Jupyter Hint v2] locator:success", summarizeTasks(tasks));
+
+      if (tasks.length === 0) {
+        throw new Error("Locator returned zero tasks. Cannot proceed.");
+      }
+
       console.info("[Jupyter Hint v2] coach:start", {
         taskCount: tasks.length,
         guideInstructionChars: guideInstructions.length
@@ -54,10 +62,7 @@
           GUIDE_INSTRUCTIONS: guideInstructions
         }
       }, { stream: false, preventMenu: true });
-      console.log("Result", coachResult)
-      
-      const parsed = normalizeCoachJson(coachResult, "coach");
-      console.log("parsed response", parsed)
+      const parsed = parseCoachResponse(coachResult);
       console.info("[Jupyter Hint v2] coach:success", summarizeCoachJson(parsed));
 
       const hintText = typeof parsed.hint === "string" ? parsed.hint : "";
@@ -71,96 +76,6 @@
     } catch (error) {
       handlePipelineError(error);
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Deterministic locator -- ports eCornell-Coach-Evals/eval/locate.py
-  // ---------------------------------------------------------------------------
-
-  function locateTasks(studentNb) {
-    const studentCells = normalizeCells(studentNb);
-    const tasks = [];
-
-    for (let i = 0; i < studentCells.length; i++) {
-      const cell = studentCells[i];
-      if (cell.cell_type !== "code") continue;
-      const nbgrader = (cell.metadata && cell.metadata.nbgrader) || {};
-      if (!nbgrader.solution) continue;
-      const gradeId = nbgrader.grade_id;
-      if (!gradeId) continue;
-
-      const studentSrc = cellSource(cell);
-      const studentZone = extractWorkZone(studentSrc, STUDENT_BEGIN, STUDENT_END, gradeId, "student");
-
-      tasks.push({
-        id: gradeId,
-        title: inferTitle(studentSrc, gradeId),
-        student_cell_index: i,
-        student_work_zone: studentZone,
-        status: classifyStatus(studentZone)
-      });
-    }
-
-    return tasks;
-  }
-
-  function normalizeCells(nb) {
-    if (!nb) return [];
-    const raw = Array.isArray(nb) ? nb : Array.isArray(nb.cells) ? nb.cells : [];
-    return raw.map(function (cell) {
-      return {
-        cell_type: cell.cell_type || cell.type || null,
-        source: cell.source,
-        metadata: cell.metadata || {}
-      };
-    });
-  }
-
-  function cellSource(cell) {
-    const src = cell && cell.source !== undefined ? cell.source : "";
-    if (Array.isArray(src)) return src.join("");
-    return typeof src === "string" ? src : "";
-  }
-
-  function extractWorkZone(source, startMarker, endMarker, gradeId, kind) {
-    const lines = (source || "").split("\n");
-    let beginIdx = null;
-    let endIdx = null;
-    for (let i = 0; i < lines.length; i++) {
-      const stripped = lines[i].trim();
-      if (beginIdx === null && stripped === startMarker) {
-        beginIdx = i;
-      } else if (beginIdx !== null && stripped === endMarker) {
-        endIdx = i;
-        break;
-      }
-    }
-    if (beginIdx === null) {
-      throw new Error("Missing " + kind + " begin marker '" + startMarker + "' in cell " + gradeId);
-    }
-    if (endIdx === null) {
-      throw new Error("Missing " + kind + " end marker '" + endMarker + "' in cell " + gradeId);
-    }
-    return lines.slice(beginIdx + 1, endIdx).join("\n");
-  }
-
-  function inferTitle(source, gradeId) {
-    const m = (source || "").match(DEF_RE);
-    return m ? m[1] : gradeId;
-  }
-
-  function classifyStatus(workZone) {
-    const lines = (workZone || "").split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const raw = lines[i];
-      const stripped = raw.trim();
-      if (!stripped) continue;
-      if (stripped.startsWith("#")) continue;
-      if (stripped === "pass") continue;
-      if (RAISE_NOT_IMPL_RE.test(raw)) continue;
-      return "HAS_ATTEMPTED";
-    }
-    return "NOT_STARTED";
   }
 
   // ---------------------------------------------------------------------------
@@ -182,24 +97,41 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Coach response handling
+  // LLM response parsing
   // ---------------------------------------------------------------------------
 
-  function normalizeCoachJson(result, label) {
+  function parseLocatorTasks(result) {
     const raw = result && typeof result.result === "string" ? result.result : "";
-    const extracted = extractJsonObject(raw);
+    const extracted = extractJsonValue(raw, "array");
     if (!extracted) {
-      throw new Error("Unable to extract JSON from " + label + " result.");
+      throw new Error("Unable to extract JSON array from locator result.");
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(extracted);
+    } catch (error) {
+      console.error("[Jupyter Hint v2] locator:json-parse-failed", {
+        message: error && error.message ? error.message : null,
+        preview: raw.slice(0, 400)
+      });
+      throw error;
+    }
+    // Some models wrap arrays in {tasks: [...]} despite the schema; accept either.
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray(parsed.tasks)) return parsed.tasks;
+    throw new Error("Locator response is not a JSON array.");
+  }
+
+  function parseCoachResponse(result) {
+    const raw = result && typeof result.result === "string" ? result.result : "";
+    const extracted = extractJsonValue(raw, "object");
+    if (!extracted) {
+      throw new Error("Unable to extract JSON object from coach result.");
     }
     try {
-      const parsed = JSON.parse(extracted);
-      console.info("[Jupyter Hint v2] " + label + ":normalized", {
-        rawChars: raw.length,
-        jsonChars: JSON.stringify(parsed).length
-      });
-      return parsed;
+      return JSON.parse(extracted);
     } catch (error) {
-      console.error("[Jupyter Hint v2] " + label + ":json-parse-failed", {
+      console.error("[Jupyter Hint v2] coach:json-parse-failed", {
         message: error && error.message ? error.message : null,
         preview: raw.slice(0, 400)
       });
@@ -207,16 +139,18 @@
     }
   }
 
-  function extractJsonObject(raw) {
+  function extractJsonValue(raw, kind) {
     if (!raw || typeof raw !== "string") return null;
-    const fencedMatch = raw.match(/```json\s*([\s\S]*?)\s*```/i);
+    const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
     if (fencedMatch && fencedMatch[1]) {
       return fencedMatch[1].trim();
     }
-    const firstBrace = raw.indexOf("{");
-    const lastBrace = raw.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      return raw.slice(firstBrace, lastBrace + 1).trim();
+    const open = kind === "array" ? "[" : "{";
+    const close = kind === "array" ? "]" : "}";
+    const first = raw.indexOf(open);
+    const last = raw.lastIndexOf(close);
+    if (first !== -1 && last !== -1 && last > first) {
+      return raw.slice(first, last + 1).trim();
     }
     return null;
   }
@@ -236,8 +170,8 @@
 
   function summarizeTasks(tasks) {
     return {
-      count: tasks.length,
-      tasks: tasks.map(function (t) {
+      count: Array.isArray(tasks) ? tasks.length : 0,
+      tasks: (Array.isArray(tasks) ? tasks : []).map(function (t) {
         return { id: t.id, title: t.title, status: t.status };
       })
     };
